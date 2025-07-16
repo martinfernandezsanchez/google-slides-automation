@@ -9,8 +9,7 @@ import logging
 import sys
 import traceback
 import time
-from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from contextlib import contextmanager
 import json
 
@@ -221,7 +220,4 @@ def get_logger() -> SlidesAutomationLogger:
         _logger_instance = SlidesAutomationLogger()
     return _logger_instance
 
-def set_logger(logger: SlidesAutomationLogger):
-    """Set the global logger instance."""
-    global _logger_instance
-    _logger_instance = logger 
+ 

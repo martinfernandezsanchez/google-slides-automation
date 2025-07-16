@@ -7,8 +7,7 @@ managing resources efficiently and providing better error handling.
 
 import os
 import re
-from typing import Dict, List, Any, Optional, Tuple
-from google.oauth2.credentials import Credentials
+from typing import Dict, List, Any, Optional
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -362,15 +361,7 @@ class GoogleSlidesAPIHandler:
         
         return chunks
     
-    def _track_batch_update_stats(self, requests: List[Dict[str, Any]]) -> None:
-        """
-        Track batch update statistics for reporting.
-        
-        Args:
-            requests: List of update requests
-        """
-        # This method will be called by the automation class to track stats
-        pass
+
     
     def find_tables_with_array_markers(self, presentation: Dict[str, Any]) -> List[Dict[str, Any]]:
         """

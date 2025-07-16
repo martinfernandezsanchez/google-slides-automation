@@ -5,10 +5,8 @@ A Python client library for interacting with the Google Slides Automation Servic
 """
 
 import requests
-import json
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
-from datetime import datetime
 
 
 @dataclass
