@@ -47,38 +47,25 @@ class HealthResponse(BaseModel):
     version: str
     uptime: float
 
-def get_user_credentials(authorization: Optional[str] = Header(None, description="Authorization header with Bearer token")) -> UserCredentials:
-    """Create user credentials object from the Authorization header."""
-    if not authorization:
+def get_user_credentials(x_goog_user_token: Optional[str] = Header(None, description="User's Google OAuth2 Access Token")) -> UserCredentials:
+    """Create user credentials object from the X-Goog-User-Token header."""
+    if not x_goog_user_token:
         raise HTTPException(
-            status_code=401,
-            detail="Missing Authorization header. Please provide: Authorization: Bearer <your_access_token>"
-        )
-    
-    # Parse Bearer token from Authorization header
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Authorization header must use Bearer token format: Authorization: Bearer <your_access_token>"
-        )
-    
-    access_token = authorization[7:]  # Remove "Bearer " prefix
-    
-    if not access_token or len(access_token) < 20:  # Basic sanity check
-        raise HTTPException(
-            status_code=401, 
-            detail="Invalid or expired access token provided in Authorization header."
+            status_code=400,
+            detail="Missing X-Goog-User-Token header containing the user's OAuth2 access token."
         )
     
     try:
         # This creates a credentials object from the user's access token.
-        credentials = UserCredentials(token=access_token)
+        credentials = UserCredentials(token=x_goog_user_token)
+        if not x_goog_user_token or len(x_goog_user_token) < 20: # Basic sanity check
+             raise HTTPException(status_code=401, detail="Invalid or expired token provided in X-Goog-User-Token.")
         return credentials
     except Exception as e:
-        logger.log_error("Failed to create credentials from Authorization header", e)
+        logger.log_error("Failed to create credentials from X-Goog-User-Token", e)
         raise HTTPException(
             status_code=401,
-            detail="Could not validate credentials from Authorization header",
+            detail="Could not validate credentials from X-Goog-User-Token",
         )
 
 @asynccontextmanager
