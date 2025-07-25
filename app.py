@@ -10,31 +10,29 @@ import time
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi.security import OAuth2PasswordBearer
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.exceptions import RefreshError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from fastapi.responses import Response
 
 # Import our existing modules
 from slides_automation import GoogleSlidesAutomation
 from logger import get_logger
 
-# Prometheus metrics
-REQUEST_COUNT = Counter('slides_automation_requests_total', 'Total requests', ['endpoint', 'status'])
-REQUEST_DURATION = Histogram('slides_automation_request_duration_seconds', 'Request duration', ['endpoint'])
-BATCH_UPDATE_COUNT = Counter('slides_automation_batch_updates_total', 'Total batch updates', ['operation_type'])
-PRESENTATION_CREATED = Counter('slides_automation_presentations_created_total', 'Presentations created')
-
 # Global variables
 automation_service: Optional[GoogleSlidesAutomation] = None
 logger = get_logger()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
 
 class CreatePresentationRequest(BaseModel):
     template_id: str = Field(..., description="Google Slides template ID")
     title: str = Field(..., description="Title for the new presentation")
     json_data: Dict[str, Any] = Field(..., description="JSON data to populate the presentation")
     credentials_path: Optional[str] = Field("credentials.json", description="Path to credentials file")
+    drive_folder_url: Optional[str] = Field(None, description="Google Drive folder URL to save the presentation in")
 
 class CreatePresentationResponse(BaseModel):
     presentation_id: str
@@ -48,6 +46,40 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     uptime: float
+
+def get_user_credentials(authorization: Optional[str] = Header(None, description="Authorization header with Bearer token")) -> UserCredentials:
+    """Create user credentials object from the Authorization header."""
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header. Please provide: Authorization: Bearer <your_access_token>"
+        )
+    
+    # Parse Bearer token from Authorization header
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization header must use Bearer token format: Authorization: Bearer <your_access_token>"
+        )
+    
+    access_token = authorization[7:]  # Remove "Bearer " prefix
+    
+    if not access_token or len(access_token) < 20:  # Basic sanity check
+        raise HTTPException(
+            status_code=401, 
+            detail="Invalid or expired access token provided in Authorization header."
+        )
+    
+    try:
+        # This creates a credentials object from the user's access token.
+        credentials = UserCredentials(token=access_token)
+        return credentials
+    except Exception as e:
+        logger.log_error("Failed to create credentials from Authorization header", e)
+        raise HTTPException(
+            status_code=401,
+            detail="Could not validate credentials from Authorization header",
+        )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -64,8 +96,9 @@ async def lifespan(app: FastAPI):
         automation_service = GoogleSlidesAutomation(credentials_path)
         logger.info("Google Slides Automation Service initialized successfully")
     except Exception as e:
-        logger.error("Failed to initialize automation service", error=e)
-        raise
+        logger.warning(f"Failed to initialize automation service: {e}")
+        logger.warning("Service will start but presentation creation will not work until credentials are available")
+        automation_service = None
     
     # Store startup time for health checks
     app.state.start_time = start_time
@@ -103,17 +136,19 @@ async def monitor_requests(request: Request, call_next):
     # Calculate duration
     duration = time.time() - start_time
     
-    # Record metrics
-    endpoint = request.url.path
-    status = response.status_code
-    REQUEST_COUNT.labels(endpoint=endpoint, status=status).inc()
-    REQUEST_DURATION.labels(endpoint=endpoint).observe(duration)
-    
     # Add custom headers for monitoring
     response.headers["X-Request-Duration"] = str(duration)
     
     return response
 
+# GET /health
+# Returns the health status of the service.
+# - Response:
+#   {
+#     "status": "healthy" | "unhealthy",
+#     "version": "1.0.0",
+#     "uptime": 1234.56
+#   }
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
@@ -124,13 +159,29 @@ async def health_check():
         uptime=uptime
     )
 
-@app.get("/metrics")
-async def metrics():
-    """Prometheus metrics endpoint."""
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
+# POST /presentations/create
+# Creates a new presentation from a template and populates it with JSON data.
+# - Request Body:
+#   {
+#     "template_id": "your_google_slides_template_id",
+#     "title": "New Presentation Title",
+#     "json_data": { "key": "value", "items": [...] },
+#     "drive_folder_url": "https://... or null"
+#   }
+# - Response:
+#   {
+#     "presentation_id": "new_presentation_id",
+#     "presentation_url": "https://...",
+#     "batch_updates": 5,
+#     "total_requests": 150,
+#     "duration_seconds": 15.2,
+#     "status": "success"
+#   }
 @app.post("/presentations/create", response_model=CreatePresentationResponse)
-async def create_presentation(request: CreatePresentationRequest):
+async def create_presentation(
+    request: CreatePresentationRequest,
+    user_credentials: UserCredentials = Depends(get_user_credentials)
+):
     """
     Create a presentation from template and populate with JSON data.
     
@@ -139,12 +190,12 @@ async def create_presentation(request: CreatePresentationRequest):
     2. Populates it with the provided JSON data
     3. Returns the new presentation ID and URL
     """
-    if not automation_service:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
     start_time = time.time()
     
     try:
+        # Initialize the automation service with user's credentials for this request
+        automation_service = GoogleSlidesAutomation(user_credentials=user_credentials)
+
         with logger.operation_context("API Create Presentation", {
             'template_id': request.template_id,
             'title': request.title,
@@ -154,7 +205,8 @@ async def create_presentation(request: CreatePresentationRequest):
             presentation_id = automation_service.create_presentation_from_template(
                 template_id=request.template_id,
                 json_data=request.json_data,
-                title=request.title
+                title=request.title,
+                drive_folder_url=request.drive_folder_url
             )
             
             # Calculate duration
@@ -162,11 +214,6 @@ async def create_presentation(request: CreatePresentationRequest):
             
             # Get batch update statistics
             stats = automation_service.batch_update_stats
-            
-            # Record metrics
-            PRESENTATION_CREATED.inc()
-            for op_type, count in stats['operations_by_type'].items():
-                BATCH_UPDATE_COUNT.labels(operation_type=op_type).inc(count)
             
             # Create response
             presentation_url = f"https://docs.google.com/presentation/d/{presentation_id}/edit"
@@ -188,6 +235,12 @@ async def create_presentation(request: CreatePresentationRequest):
             
             return response
             
+    except RefreshError as e:
+        logger.log_error("Token refresh error during presentation creation", e, {
+            'template_id': request.template_id,
+            'title': request.title,
+        })
+        raise HTTPException(status_code=401, detail=f"Authentication token is invalid or expired: {e}")
     except Exception as e:
         duration = time.time() - start_time
         logger.log_error("Failed to create presentation via API", e, {
@@ -197,44 +250,18 @@ async def create_presentation(request: CreatePresentationRequest):
         })
         raise HTTPException(status_code=500, detail=f"Failed to create presentation: {str(e)}")
 
-@app.get("/presentations/{presentation_id}/info")
-async def get_presentation_info(presentation_id: str):
-    """Get information about a specific presentation."""
-    if not automation_service:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    try:
-        presentation = automation_service.api_handler.get_presentation(presentation_id)
-        
-        return {
-            "presentation_id": presentation_id,
-            "title": presentation.get('title', 'Unknown'),
-            "slide_count": len(presentation.get('slides', [])),
-            "presentation_url": f"https://docs.google.com/presentation/d/{presentation_id}/edit"
-        }
-    except Exception as e:
-        logger.log_error("Failed to get presentation info", e, {'presentation_id': presentation_id})
-        raise HTTPException(status_code=404, detail=f"Presentation not found or access denied: {str(e)}")
-
-@app.get("/templates/{template_id}/info")
-async def get_template_info(template_id: str):
-    """Get information about a specific template."""
-    if not automation_service:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    
-    try:
-        presentation = automation_service.api_handler.get_presentation(template_id)
-        
-        return {
-            "template_id": template_id,
-            "title": presentation.get('title', 'Unknown'),
-            "slide_count": len(presentation.get('slides', [])),
-            "template_url": f"https://docs.google.com/presentation/d/{template_id}/edit"
-        }
-    except Exception as e:
-        logger.log_error("Failed to get template info", e, {'template_id': template_id})
-        raise HTTPException(status_code=404, detail=f"Template not found or access denied: {str(e)}")
-
+# GET /
+# Returns basic information about the service and available endpoints.
+# - Response:
+#   {
+#     "service": "Google Slides Automation Service",
+#     "version": "1.0.0",
+#     "status": "running",
+#     "endpoints": {
+#       "health": "/health",
+#       "create_presentation": "/presentations/create"
+#     }
+#   }
 @app.get("/")
 async def root():
     """Root endpoint with service information."""
@@ -244,13 +271,25 @@ async def root():
         "status": "running",
         "endpoints": {
             "health": "/health",
-            "metrics": "/metrics",
-            "create_presentation": "/presentations/create",
-            "presentation_info": "/presentations/{presentation_id}/info",
-            "template_info": "/templates/{template_id}/info"
+            "create_presentation": "/presentations/create"
         }
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    import sys
+    import os
+    
+    # Add startup logging
+    print("🚀 Starting Google Slides Automation Service")
+    print(f"Python version: {sys.version}")
+    print(f"Working directory: {os.getcwd()}")
+    print(f"Environment variables: {dict(os.environ)}")
+    
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    except Exception as e:
+        print(f"❌ Failed to start service: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1) 

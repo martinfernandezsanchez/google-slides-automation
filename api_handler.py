@@ -7,13 +7,15 @@ managing resources efficiently and providing better error handling.
 
 import os
 import re
+import json
 from typing import Dict, List, Any, Optional
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth import default
 from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-import pickle
 from logger import get_logger
+from google.oauth2.service_account import Credentials
 
 
 class GoogleSlidesAPIHandler:
@@ -25,54 +27,60 @@ class GoogleSlidesAPIHandler:
         'https://www.googleapis.com/auth/drive'
     ]
     
-    def __init__(self, credentials_path: str = 'credentials.json'):
+    def __init__(self, credentials_path: str = 'credentials.json', user_credentials: Optional[UserCredentials] = None):
         """
         Initialize the Google Slides API handler.
         
         Args:
             credentials_path: Path to the Google API credentials JSON file
+            user_credentials: Optional user credentials to use for authentication
         """
         self.credentials_path = credentials_path
+        self.user_credentials = user_credentials
         self.slides_service = None
         self.drive_service = None
         self.logger = get_logger()
         self._authenticate()
     
     def _authenticate(self):
-        """Authenticate with Google API using OAuth2."""
+        """Authenticate with Google API using service account or user credentials."""
         with self.logger.operation_context("Google API Authentication", {
-            'credentials_path': self.credentials_path
+            'credentials_path': self.credentials_path,
+            'has_user_credentials': bool(self.user_credentials)
         }):
-            creds = None
-            
-            # The file token.pickle stores the user's access and refresh tokens.
-            if os.path.exists('token.pickle'):
-                self.logger.log_debug("Loading existing token from token.pickle")
-                with open('token.pickle', 'rb') as token:
-                    creds = pickle.load(token)
-            
-            # If there are no (valid) credentials available, let the user log in.
-            if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
-                    self.logger.log_info("Refreshing expired token")
-                    creds.refresh(Request())
+            try:
+                creds = None
+                if self.user_credentials:
+                    self.logger.log_info("Using user-provided credentials")
+                    creds = self.user_credentials
+                # Try to load service account credentials from file
+                elif os.path.exists(self.credentials_path):
+                    self.logger.log_info(f"Loading service account credentials from {self.credentials_path}")
+                    with open(self.credentials_path, 'r') as f:
+                        service_account_info = json.load(f)
+                    
+                    from google.oauth2 import service_account
+                    creds = service_account.Credentials.from_service_account_info(
+                        service_account_info, scopes=self.SCOPES
+                    )
                 else:
-                    self.logger.log_info("Starting OAuth2 flow for new authentication")
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        self.credentials_path, self.SCOPES)
-                    creds = flow.run_local_server(port=0)
+                    # Fall back to default credentials (useful for Cloud Run)
+                    self.logger.log_info("Using default credentials")
+                    creds, project = default(scopes=self.SCOPES)
                 
-                # Save the credentials for the next run
-                self.logger.log_debug("Saving token to token.pickle")
-                with open('token.pickle', 'wb') as token:
-                    pickle.dump(creds, token)
-            
-            # Initialize services
-            self.logger.log_debug("Initializing Google API services")
-            self.slides_service = build('slides', 'v1', credentials=creds)
-            self.drive_service = build('drive', 'v3', credentials=creds)
-            
-            self.logger.log_success("Google API services initialized successfully")
+                if not creds:
+                    raise Exception("Authentication failed: No valid credentials found.")
+
+                # Initialize services
+                self.logger.log_debug("Initializing Google API services")
+                self.slides_service = build('slides', 'v1', credentials=creds)
+                self.drive_service = build('drive', 'v3', credentials=creds)
+                
+                self.logger.log_success("Google API services initialized successfully")
+                
+            except Exception as e:
+                self.logger.log_error("Failed to authenticate with Google API", e)
+                raise
     
     def copy_presentation(self, template_id: str, title: str) -> str:
         """
@@ -252,346 +260,289 @@ class GoogleSlidesAPIHandler:
                     body={'requests': requests}
                 ).execute()
                 
-                self.logger.log_success("Batch update executed successfully", {
-                    'request_count': len(requests),
-                    'payload_size_bytes': payload_size
-                })
-                
-                # Track batch update statistics
                 if stats_callback:
                     stats_callback(requests)
-                
+                    
             except HttpError as error:
                 self.logger.log_error("Failed to execute batch update", error, {
                     'presentation_id': presentation_id,
-                    'request_count': len(requests),
-                    'payload_size_bytes': payload_size
+                    'request_count': len(requests)
                 })
-                # Re-raise the original error instead of creating a new one
-                raise
-    
+                raise error
+
     def _calculate_payload_size(self, requests: List[Dict[str, Any]]) -> int:
-        """
-        Calculate the size of the batch update payload in bytes.
-        
-        Args:
-            requests: List of update requests
-            
-        Returns:
-            Size of the payload in bytes
-        """
-        import json
-        
-        # Create the full payload structure
-        payload = {
-            'requests': requests
-        }
-        
-        # Convert to JSON string and calculate size
-        json_string = json.dumps(payload, separators=(',', ':'))
-        return len(json_string.encode('utf-8'))
+        """Calculate the JSON payload size of a list of requests."""
+        try:
+            return len(json.dumps({'requests': requests}).encode('utf-8'))
+        except (TypeError, OverflowError) as e:
+            self.logger.log_warning(f"Could not calculate payload size: {e}")
+            return 0
     
     def batch_update_with_size_check(self, presentation_id: str, requests: List[Dict[str, Any]], 
-                                   max_size_bytes: int = 10 * 1024 * 1024) -> None:
+                                   max_size_bytes: int = 10 * 1024 * 1024, operation_description: str = "Unknown operation",
+                                   stats_callback=None) -> None:
         """
-        Execute a batch update with automatic size checking and chunking.
+        Execute batch update and automatically split into chunks if payload exceeds size limit.
         
         Args:
             presentation_id: The ID of the presentation
             requests: List of update requests
-            max_size_bytes: Maximum payload size in bytes (default: 10MB)
-            
-        Raises:
-            HttpError: If the API request fails
-            ValueError: If individual request exceeds size limit
+            max_size_bytes: Maximum payload size for a single batch
+            operation_description: Description of the operation for tracking purposes
+            stats_callback: Optional callback function for tracking batch statistics
         """
         if not requests:
             self.logger.log_debug("Skipping empty batch update")
             return
-        
-        # Check if we need to split the batch
-        payload_size = self._calculate_payload_size(requests)
-        
-        if payload_size <= max_size_bytes:
-            # Single batch is fine
-            self.batch_update(presentation_id, requests)
-        else:
-            # Need to split into chunks
-            self.logger.log_info(f"Payload size ({payload_size:,} bytes) exceeds limit ({max_size_bytes:,} bytes). Splitting into chunks.")
             
-            chunks = self._split_requests_into_chunks(requests, max_size_bytes)
-            
+        chunks = self._split_requests_into_chunks(requests, max_size_bytes)
+        
+        with self.logger.operation_context("Batch Update with Size Check", {
+            'presentation_id': presentation_id,
+            'total_requests': len(requests),
+            'chunk_count': len(chunks),
+            'operation_description': operation_description
+        }):
             for i, chunk in enumerate(chunks):
                 chunk_size = self._calculate_payload_size(chunk)
                 self.logger.log_info(f"Executing chunk {i+1}/{len(chunks)} with {len(chunk)} requests ({chunk_size:,} bytes)")
+                
+                # Call stats callback if provided
+                if stats_callback:
+                    stats_callback(chunk, f"{operation_description} (chunk {i+1}/{len(chunks)})")
+                
                 self.batch_update(presentation_id, chunk)
-    
+
     def _split_requests_into_chunks(self, requests: List[Dict[str, Any]], 
                                   max_size_bytes: int) -> List[List[Dict[str, Any]]]:
         """
-        Split requests into chunks that fit within the size limit.
+        Split a list of requests into smaller chunks that are under the size limit.
         
         Args:
-            requests: List of update requests
-            max_size_bytes: Maximum payload size in bytes
+            requests: The original list of requests
+            max_size_bytes: The maximum size for each chunk
             
         Returns:
-            List of request chunks
+            A list of request chunks
         """
+        if not requests:
+            return []
+            
+        # If the total size is already under the limit, no need to split
+        total_size = self._calculate_payload_size(requests)
+        if total_size <= max_size_bytes:
+            return [requests]
+            
         chunks = []
         current_chunk = []
         current_size = 0
         
         for request in requests:
-            # Calculate size of this single request
-            single_request_size = self._calculate_payload_size([request])
+            request_size = self._calculate_payload_size([request])
             
-            # If adding this request would exceed the limit, start a new chunk
-            if current_size + single_request_size > max_size_bytes and current_chunk:
+            if current_size + request_size > max_size_bytes and current_chunk:
                 chunks.append(current_chunk)
-                current_chunk = [request]
-                current_size = single_request_size
-            else:
-                current_chunk.append(request)
-                current_size = self._calculate_payload_size(current_chunk)
-        
-        # Add the last chunk if it has requests
+                current_chunk = []
+                current_size = 0
+                
+            current_chunk.append(request)
+            current_size += request_size
+            
         if current_chunk:
             chunks.append(current_chunk)
-        
+            
         return chunks
-    
 
-    
     def find_tables_with_array_markers(self, presentation: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Find all tables in the presentation that have array markers.
-        
-        Args:
-            presentation: The presentation data
-            
-        Returns:
-            List of tables with their array markers and slide information
-        """
+        """Find all tables with array markers (e.g., {{my_array}})."""
         tables_with_markers = []
-        
-        for slide_index, slide in enumerate(presentation.get('slides', [])):
-            slide_id = slide['objectId']
-            
+        for slide in presentation.get('slides', []):
             for element in slide.get('pageElements', []):
                 if 'table' in element:
-                    table = element['table']
-                    table_id = element['objectId']
-                    
-                    # Check for array markers
-                    array_key = self._find_array_marker_in_table(table)
+                    array_key = self._find_array_marker_in_table(element['table'])
                     if array_key:
                         tables_with_markers.append({
-                            'slide_id': slide_id,
-                            'slide_index': slide_index,
-                            'table_id': table_id,
-                            'table': table,
+                            'slide_id': slide['objectId'],
+                            'table_id': element['objectId'],
+                            'array_key': array_key,
+                            'table_info': element['table']
+                        })
+                        self.logger.log_discovery("Found table with array marker", {
+                            'slide_id': slide['objectId'],
+                            'table_id': element['objectId'],
                             'array_key': array_key
                         })
-        
         return tables_with_markers
-    
+
     def _find_array_marker_in_table(self, table: Dict[str, Any]) -> Optional[str]:
-        """
-        Find array marker in table headers.
-        
-        Args:
-            table: The table data
-            
-        Returns:
-            The array key if found, None otherwise
-        """
-        if not table.get('tableRows'):
-            return None
-        
-        # Check the first row (headers) for array markers
-        header_row = table['tableRows'][0]
-        for cell in header_row.get('tableCells', []):
-            if 'text' in cell:
-                text_elements = cell['text'].get('textElements', [])
-                for text_element in text_elements:
-                    if 'textRun' in text_element:
-                        text = text_element['textRun'].get('content', '')
-                        # Look for array pattern: {{ARRAY:key}}
-                        match = re.search(r'\{\{ARRAY:([^}]+)\}\}', text)
-                        if match:
-                            return match.group(1)
+        """Find an array marker like {{my_array}} in any cell of a table."""
+        for row in table.get('tableRows', []):
+            for cell in row.get('tableCells', []):
+                for element in cell.get('text', {}).get('textElements', []):
+                    content = element.get('textRun', {}).get('content', '')
+                    match = re.search(r'\{\{(\w+)\}\}', content)
+                    if match:
+                        return match.group(1)
         return None
-    
+
     def get_table_headers(self, table: Dict[str, Any]) -> List[str]:
-        """
-        Extract headers from a table, removing array markers.
-        
-        Args:
-            table: The table data
-            
-        Returns:
-            List of cleaned header strings
-        """
+        """Extract the headers from the first row of a table."""
         headers = []
         if table.get('tableRows'):
             header_row = table['tableRows'][0]
             for cell in header_row.get('tableCells', []):
-                if 'text' in cell:
-                    text_content = ''
-                    for text_element in cell['text'].get('textElements', []):
-                        if 'textRun' in text_element:
-                            text_content += text_element['textRun'].get('content', '')
-                    # Remove the ARRAY marker from headers
-                    text_content = re.sub(r'\{\{ARRAY:[^}]+\}\}', '', text_content).strip()
-                    headers.append(text_content)
+                header_text = ""
+                for element in cell.get('text', {}).get('textElements', []):
+                    header_text += element.get('textRun', {}).get('content', '')
+                headers.append(header_text.strip())
         return headers
-    
+
     def create_table_row_request(self, table_id: str, row_index: int, cell_values: list) -> dict:
-        """
-        Create a request to insert a table row (Google Slides API expects camelCase keys).
-        Args:
-            table_id: The ID of the table
-            row_index: The index where to insert the row (1-based, where 1 is first data row)
-            cell_values: List of values for each cell
-        Returns:
-            The insert table row request (with camelCase keys)
-        """
-        # For insertTableRows, we need to reference an existing row
-        # Since we have only 1 row (header), we reference row 0 and insert below
+        """Create a request to insert a new row into a table."""
         return {
             'insertTableRows': {
                 'tableObjectId': table_id,
                 'cellLocation': {
-                    'rowIndex': 0,  # Reference the header row (0-based)
+                    'rowIndex': row_index,
                     'columnIndex': 0
                 },
-                'number': 1,
-                'insertBelow': True
+                'insertBelow': True,
+                'number': 1
             }
         }
-    
+
     def create_duplicate_slide_request(self, slide_id: str) -> Dict[str, Any]:
-        """
-        Create a request to duplicate a slide.
-        
-        Args:
-            slide_id: The ID of the slide to duplicate
-            
-        Returns:
-            The duplicate object request
-        """
+        """Create a request to duplicate a slide."""
+        self.logger.log_slide_operation(slide_id, "Creating duplicate request")
         return {
             'duplicateObject': {
-                'objectId': slide_id
+                'objectId': slide_id,
             }
         }
-    
+
     def create_delete_slide_request(self, slide_id: str) -> Dict[str, Any]:
-        """
-        Create a request to delete a slide.
-        
-        Args:
-            slide_id: The ID of the slide to delete
-            
-        Returns:
-            The delete object request
-        """
+        """Create a request to delete a slide."""
+        self.logger.log_slide_operation(slide_id, "Creating delete request")
         return {
             'deleteObject': {
                 'objectId': slide_id
             }
         }
-    
+
     def create_replace_text_request(self, old_text: str, new_text: str) -> Dict[str, Any]:
         """
-        Create a request to replace text.
+        Create a request to replace all occurrences of text in a presentation.
         
         Args:
             old_text: The text to replace
-            new_text: The replacement text
+            new_text: The text to replace it with
             
         Returns:
-            The replace all text request
+            A dictionary representing the replaceAllText request
         """
+        self.logger.log_info("Creating text replacement request", {
+            'old_text': old_text,
+            'new_text': new_text
+        })
         return {
             'replaceAllText': {
-                'containsText': {
-                    'text': old_text,
-                    'matchCase': True
-                },
+                'containsText': {'text': old_text, 'matchCase': False},
+                'pageObjectIds': [],
                 'replaceText': new_text
             }
         }
-    
+
     def create_update_table_cell_request(self, table_id: str, row_index: int, column_index: int, text: str) -> Dict[str, Any]:
         """
-        Create a request to update a specific table cell.
+        Create a request to update the text in a table cell.
         
         Args:
-            table_id: The ID of the table
-            row_index: The row index (0-based)
-            column_index: The column index (0-based)
-            text: The text to set in the cell
+            table_id: ID of the table
+            row_index: Row index of the cell
+            column_index: Column index of the cell
+            text: The new text to insert
             
         Returns:
-            The update table cell properties request
+            A dictionary representing the API request
         """
-        return {
-            'updateTableCellProperties': {
-                'objectId': table_id,
-                'tableRange': {
-                    'location': {
-                        'rowIndex': row_index,
-                        'columnIndex': column_index
-                    },
-                    'rowSpan': 1,
-                    'columnSpan': 1
-                },
-                'tableCellProperties': {
-                    'tableCellBackgroundFill': {
-                        'propertyState': 'NOT_RENDERED'
-                    }
-                },
-                'fields': 'tableCellBackgroundFill'
-            }
-        }
-    
+        return self.create_update_table_cell_text_request(table_id, row_index, column_index, text)
+        
     def create_update_table_cell_text_request(self, table_id: str, row_index: int, column_index: int, text: str) -> Dict[str, Any]:
         """
-        Create a request to update text in a specific table cell.
-        This is more efficient than replaceAllText for table operations.
+        Create a request to update the text in a table cell.
+        This is a more specific version to handle text replacement.
         
         Args:
-            table_id: The ID of the table
-            row_index: The row index (0-based)
-            column_index: The column index (0-based)
-            text: The text to set in the cell
+            table_id: ID of the table
+            row_index: Row index of the cell
+            column_index: Column index of the cell
+            text: The new text to insert
             
         Returns:
-            The update text style request
+            A dictionary representing the API request
         """
         return {
             'insertText': {
                 'objectId': table_id,
-                'insertionIndex': 0,
-                'text': text
+                'cellLocation': {
+                    'rowIndex': row_index,
+                    'columnIndex': column_index
+                },
+                'text': text,
+                'insertionIndex': 0
             }
-        } 
+        }
 
     def get_shape_ids_for_slide(self, presentation: Dict[str, Any], slide_object_id: str) -> dict:
-        """
-        Get the object IDs for the title and subtitle shapes for a given slide.
-        Returns a dict with keys 'title' and 'subtitle' if found.
-        """
-        shape_ids = {}
+        """Get the title and subtitle shape IDs for a given slide."""
+        shape_ids = {'title': None, 'subtitle': None}
         for slide in presentation.get('slides', []):
-            if slide.get('objectId') == slide_object_id:
+            if slide['objectId'] == slide_object_id:
                 for element in slide.get('pageElements', []):
-                    if 'shape' in element:
-                        shape_type = element['shape'].get('shapeType', '')
-                        if shape_type == 'TITLE':
-                            shape_ids['title'] = element['objectId']
-                        elif shape_type == 'SUBTITLE':
-                            shape_ids['subtitle'] = element['objectId']
-        return shape_ids 
+                    if element.get('shape', {}).get('placeholder', {}).get('type') == 'TITLE':
+                        shape_ids['title'] = element['objectId']
+                    elif element.get('shape', {}).get('placeholder', {}).get('type') == 'SUBTITLE':
+                        shape_ids['subtitle'] = element['objectId']
+        return shape_ids
+    
+    def move_presentation_to_folder(self, presentation_id: str, folder_url: str):
+        """
+        Move a presentation to a specific Google Drive folder.
+        
+        Args:
+            presentation_id: The ID of the presentation to move
+            folder_url: The URL of the Google Drive folder
+        """
+        try:
+            folder_id = self._extract_folder_id_from_url(folder_url)
+            self.logger.log_info(f"Moving presentation {presentation_id} to folder {folder_id}")
+            
+            # Get the file to move
+            file = self.drive_service.files().get(fileId=presentation_id, fields='parents').execute()
+            previous_parents = ",".join(file.get('parents'))
+            
+            # Move the file
+            self.drive_service.files().update(
+                fileId=presentation_id,
+                addParents=folder_id,
+                removeParents=previous_parents,
+                fields='id, parents'
+            ).execute()
+            
+            self.logger.log_success(f"Successfully moved presentation {presentation_id} to folder {folder_id}")
+            
+        except Exception as e:
+            self.logger.log_error(f"Failed to move presentation {presentation_id} to folder {folder_url}", e)
+            # We don't re-raise the exception because moving the file is not a critical failure
+            
+    def _extract_folder_id_from_url(self, folder_url: str) -> str:
+        """Extract folder ID from Google Drive folder URL."""
+        match = re.search(r'/folders/([a-zA-Z0-9_-]+)', folder_url)
+        if match:
+            return match.group(1)
+        
+        match = re.search(r'id=([a-zA-Z0-9_-]+)', folder_url)
+        if match:
+            return match.group(1)
+            
+        raise ValueError("Invalid Google Drive folder URL") 

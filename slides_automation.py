@@ -7,22 +7,28 @@ This module provides functionality to:
 3. Perform dynamic table operations and text replacement
 """
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from api_handler import GoogleSlidesAPIHandler
 from logger import get_logger
+import re
+from google.oauth2.credentials import Credentials as UserCredentials
 
 
 class GoogleSlidesAutomation:
     """Main class for Google Slides automation operations."""
     
-    def __init__(self, credentials_path: str = 'credentials.json'):
+    def __init__(self, credentials_path: str = 'credentials.json', user_credentials: Optional[UserCredentials] = None):
         """
         Initialize the Google Slides automation.
         
         Args:
             credentials_path: Path to the Google API credentials JSON file
+            user_credentials: Optional user credentials to use for authentication
         """
-        self.api_handler = GoogleSlidesAPIHandler(credentials_path)
+        self.api_handler = GoogleSlidesAPIHandler(
+            credentials_path=credentials_path,
+            user_credentials=user_credentials
+        )
         self.logger = get_logger()
         self.batch_update_stats = {
             'total_batches': 0,
@@ -31,13 +37,6 @@ class GoogleSlidesAutomation:
             'batch_details': []  # Track each batch with details
         }
         
-        # Override the API handler's batch update methods to track statistics
-        self._original_batch_update = self.api_handler.batch_update
-        self._original_batch_update_with_size_check = self.api_handler.batch_update_with_size_check
-        
-        # Replace with tracking versions
-        self.api_handler.batch_update = lambda pid, reqs: self._original_batch_update(pid, reqs, lambda reqs: self._track_batch_stats(reqs, "Unknown operation"))
-        self.api_handler.batch_update_with_size_check = self._tracked_batch_update_with_size_check
     
     def _track_batch_stats(self, requests: List[Dict[str, Any]], operation_description: str = "Unknown operation") -> None:
         """Track batch update statistics with operation description."""
@@ -64,30 +63,6 @@ class GoogleSlidesAutomation:
             batch_detail['request_types'][request_type] = batch_detail['request_types'].get(request_type, 0) + 1
         
         self.batch_update_stats['batch_details'].append(batch_detail)
-    
-    def _tracked_batch_update_with_size_check(self, presentation_id: str, requests: List[Dict[str, Any]], max_size_bytes: int = 10*1024*1024, operation_description: str = "Unknown operation") -> None:
-        """Execute batch update with size checking and tracking."""
-        if not requests:
-            self.logger.log_debug("Skipping empty batch update")
-            return
-        
-        # Check if we need to split the batch
-        payload_size = self.api_handler._calculate_payload_size(requests)
-        
-        if payload_size <= max_size_bytes:
-            # Single batch is fine
-            self._original_batch_update(presentation_id, requests, lambda reqs: self._track_batch_stats(reqs, operation_description))
-        else:
-            # Need to split into chunks
-            self.logger.log_info(f"Payload size ({payload_size:,} bytes) exceeds limit ({max_size_bytes:,} bytes). Splitting into chunks.")
-            
-            chunks = self.api_handler._split_requests_into_chunks(requests, max_size_bytes)
-            
-            for i, chunk in enumerate(chunks):
-                chunk_size = self.api_handler._calculate_payload_size(chunk)
-                chunk_description = f"{operation_description} (chunk {i+1}/{len(chunks)})"
-                self.logger.log_info(f"Executing chunk {i+1}/{len(chunks)} with {len(chunk)} requests ({chunk_size:,} bytes)")
-                self._original_batch_update(presentation_id, chunk, lambda reqs: self._track_batch_stats(reqs, chunk_description))
     
     def _log_batch_update_summary(self) -> None:
         """Log a summary of all batch update operations."""
@@ -226,7 +201,12 @@ class GoogleSlidesAutomation:
         # Execute structural changes (Step 2)
         if structural_requests:
             self.logger.log_info(f"Executing {len(structural_requests)} structural changes")
-            self.api_handler.batch_update_with_size_check(presentation_id, structural_requests, operation_description="Structural changes (slide duplication/deletion)")
+            self.api_handler.batch_update_with_size_check(
+                presentation_id, 
+                structural_requests,
+                operation_description="Structural changes (slide duplication/deletion)",
+                stats_callback=self._track_batch_stats
+            )
         
         # Get updated presentation if structural changes were made
         if structural_requests:
@@ -242,16 +222,31 @@ class GoogleSlidesAutomation:
             all_cell_requests.extend(cell_requests)
         
         if all_row_requests:
-            self.api_handler.batch_update_with_size_check(presentation_id, all_row_requests, operation_description="Insert table rows for all tables")
+            self.api_handler.batch_update_with_size_check(
+                presentation_id, 
+                all_row_requests,
+                operation_description="Insert table rows for all tables",
+                stats_callback=self._track_batch_stats
+            )
         if all_cell_requests:
-            self.api_handler.batch_update_with_size_check(presentation_id, all_cell_requests, operation_description="Populate table cells for all tables")
+            self.api_handler.batch_update_with_size_check(
+                presentation_id, 
+                all_cell_requests,
+                operation_description="Populate table cells for all tables",
+                stats_callback=self._track_batch_stats
+            )
         
         # Process text replacement for non-table elements
         self.logger.log_info("Creating text replacement requests")
         content_requests = self._create_text_replacement_requests(presentation, json_data)
         if content_requests:
             self.logger.log_info(f"Executing {len(content_requests)} content changes")
-            self.api_handler.batch_update_with_size_check(presentation_id, content_requests, operation_description="Text replacement for placeholders")
+            self.api_handler.batch_update_with_size_check(
+                presentation_id, 
+                content_requests,
+                operation_description="Text replacement for placeholders",
+                stats_callback=self._track_batch_stats
+            )
     
     def _create_table_population_requests(self, presentation: Dict, table_op: Dict) -> List[Dict]:
         """
@@ -396,39 +391,45 @@ class GoogleSlidesAutomation:
         return requests
     
     def create_presentation_from_template(self, template_id: str, json_data: Dict[str, Any], 
-                                        title: str = "Generated Presentation") -> str:
+                                        title: str = "Generated Presentation", drive_folder_url: Optional[str] = None) -> str:
         """
-        Main method to create a presentation from template and populate with JSON data.
+        Create a presentation from a template and populate it with JSON data.
         
         Args:
             template_id: The ID of the template presentation
             json_data: The JSON data to populate the presentation with
             title: Title for the new presentation
+            drive_folder_url: Optional Google Drive folder URL to save the presentation in
             
         Returns:
             The ID of the newly created presentation
         """
-        # Start logging session
-        self.logger.start_session("Create Presentation from Template", 
-            template_id=template_id,
-            title=title,
-            data_keys=list(json_data.keys()) if json_data else []
-        )
-        
-        try:
-            # Step 1: Copy the template
-            new_presentation_id = self.copy_presentation(template_id, title)
-            # Step 2: Process and populate the presentation
-            self.process_presentation(new_presentation_id, json_data)
-            self.logger.log_success("Presentation creation completed", {
-                'new_presentation_id': new_presentation_id
-            })
-            return new_presentation_id 
-        finally:
-            # Log final batch update statistics
-            self._log_batch_update_summary()
-            # End logging session
-            self.logger.end_session() 
+        with self.logger.operation_context("Create Presentation from Template", {
+            'template_id': template_id,
+            'title': title,
+            'data_keys': list(json_data.keys()) if json_data else []
+        }):
+            try:
+                # Step 1: Copy the presentation template
+                presentation_id = self.copy_presentation(template_id, title)
+                self.logger.log_info(f"Copied presentation with new ID: {presentation_id}")
+
+                # Step 2: Move the presentation to the specified Drive folder
+                if drive_folder_url:
+                    self.api_handler.move_presentation_to_folder(presentation_id, drive_folder_url)
+
+                # Step 3: Process the presentation to populate with data
+                self.process_presentation(presentation_id, json_data)
+                
+                # Log a summary of batch operations at the end
+                self._log_batch_update_summary()
+                
+                return presentation_id
+            except Exception as error:
+                self.logger.log_error("Failed to create presentation from template", error, {
+                    'template_id': template_id
+                })
+                raise
 
     def _collect_table_population_requests(self, presentation_id: str, slide_info: Dict) -> (list, list):
         """

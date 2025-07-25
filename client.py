@@ -26,24 +26,29 @@ class HealthResponse:
     status: str
     version: str
     uptime: float
+    environment: Optional[Dict[str, Any]] = None
 
 
 class SlidesAutomationClient:
     """Client for the Google Slides Automation Service."""
     
-    def __init__(self, base_url: str, api_key: Optional[str] = None):
+    def __init__(self, base_url: str, api_key: Optional[str] = None, auth_token: Optional[str] = None):
         """
         Initialize the client.
         
         Args:
             base_url: The base URL of the service (e.g., https://slides-automation-service-xxx.run.app)
             api_key: Optional API key for authentication
+            auth_token: Optional authentication token for Cloud Run services
         """
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
+        self.auth_token = auth_token
         self.session = requests.Session()
         
-        if api_key:
+        if auth_token:
+            self.session.headers.update({'Authorization': f'Bearer {auth_token}'})
+        elif api_key:
             self.session.headers.update({'Authorization': f'Bearer {api_key}'})
     
     def _make_request(self, method: str, endpoint: str, **kwargs) -> requests.Response:

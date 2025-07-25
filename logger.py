@@ -15,40 +15,17 @@ import json
 
 
 class SlidesAutomationLogger:
-    """Structured logger for Google Slides automation operations."""
-    
-    def __init__(self, log_level: str = "INFO", log_file: Optional[str] = None):
-        """
-        Initialize the logger.
+    """Custom logger compatible with standard logging interface."""
+    def __init__(self, name: str = "SlidesAutomationLogger"):
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter('[%(asctime)s] %(levelname)s %(message)s')
+        handler.setFormatter(formatter)
+        if not self.logger.handlers:
+            self.logger.addHandler(handler)
         
-        Args:
-            log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-            log_file: Optional file path for logging to file
-        """
-        self.logger = logging.getLogger('slides_automation')
-        self.logger.setLevel(getattr(logging, log_level.upper()))
-        
-        # Clear existing handlers
-        self.logger.handlers.clear()
-        
-        # Create formatter
-        formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        
-        # Console handler
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
-        
-        # File handler (if specified)
-        if log_file:
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setFormatter(formatter)
-            self.logger.addHandler(file_handler)
-        
-        # Track operation statistics
+        # Initialize stats tracking
         self.stats = {
             'start_time': None,
             'end_time': None,
@@ -59,7 +36,30 @@ class SlidesAutomationLogger:
             'batch_updates': 0,
             'errors': []
         }
-    
+
+    def log_info(self, msg, *args, **kwargs):
+        self.logger.info(msg, *args, **kwargs)
+    def log_error(self, msg, *args, **kwargs):
+        self.logger.error(msg, *args, **kwargs)
+    def log_warning(self, msg, *args, **kwargs):
+        self.logger.warning(msg, *args, **kwargs)
+    def log_debug(self, msg, *args, **kwargs):
+        self.logger.debug(msg, *args, **kwargs)
+    def log_critical(self, msg, *args, **kwargs):
+        self.logger.critical(msg, *args, **kwargs)
+
+    # Standard logging interface for compatibility
+    def info(self, msg, *args, **kwargs):
+        self.log_info(msg, *args, **kwargs)
+    def error(self, msg, *args, **kwargs):
+        self.log_error(msg, *args, **kwargs)
+    def warning(self, msg, *args, **kwargs):
+        self.log_warning(msg, *args, **kwargs)
+    def debug(self, msg, *args, **kwargs):
+        self.log_debug(msg, *args, **kwargs)
+    def critical(self, msg, *args, **kwargs):
+        self.log_critical(msg, *args, **kwargs)
+
     def start_session(self, session_name: str, **kwargs):
         """Start a new logging session."""
         self.stats['start_time'] = time.time()
